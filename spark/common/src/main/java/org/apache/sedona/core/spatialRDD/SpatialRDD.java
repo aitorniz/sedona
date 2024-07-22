@@ -27,6 +27,7 @@ import org.apache.sedona.core.enums.GridType;
 import org.apache.sedona.core.enums.IndexType;
 import org.apache.sedona.core.spatialPartitioning.*;
 import org.apache.sedona.core.spatialPartitioning.quadtree.StandardQuadTree;
+import org.apache.sedona.core.spatialPartitioning.octtree.StandardOctTree;
 import org.apache.sedona.core.spatialRddTool.IndexBuilder;
 import org.apache.sedona.core.spatialRddTool.StatCalculator;
 import org.apache.sedona.core.utils.RDDSampleUtils;
@@ -39,6 +40,7 @@ import org.apache.spark.storage.StorageLevel;
 import org.apache.spark.util.random.SamplingUtils;
 import org.locationtech.jts.geom.Coordinate;
 import org.locationtech.jts.geom.Envelope;
+import org.geotools.geometry.jts.ReferencedEnvelope3D;
 import org.locationtech.jts.geom.Geometry;
 import org.locationtech.jts.geom.GeometryFactory;
 import org.locationtech.jts.geom.LinearRing;
@@ -78,9 +80,9 @@ public class SpatialRDD<T extends Geometry>
     public long approximateTotalCount = -1;
 
     /**
-     * The boundary envelope.
+     * The 3D boundary envelope.
      */
-    public Envelope boundaryEnvelope = null;
+    public ReferencedEnvelope3D boundaryEnvelope3D = null;
 
     /**
      * The spatial partitioned RDD.
@@ -189,7 +191,7 @@ public class SpatialRDD<T extends Geometry>
             throw new IllegalArgumentException("Number of partitions must be >= 0");
         }
 
-        if (this.boundaryEnvelope == null) {
+        if (this.boundaryEnvelope3D == null) {
             throw new Exception("[AbstractSpatialRDD][spatialPartitioning] SpatialRDD boundary is null. Please call analyze() first.");
         }
         if (this.approximateTotalCount == -1) {
@@ -205,11 +207,11 @@ public class SpatialRDD<T extends Geometry>
         // See https://github.com/apache/spark/blob/412b0e8969215411b97efd3d0984dc6cac5d31e0/core/src/main/scala/org/apache/spark/rdd/RDD.scala#L508
         // Here, we choose to get samples faster over getting exactly specified number of samples.
         final double fraction = SamplingUtils.computeFractionForSampleSize(sampleNumberOfRecords, approximateTotalCount, false);
-        List<Envelope> samples = this.rawSpatialRDD.sample(false, fraction)
-                .map(new Function<T, Envelope>()
+        List<ReferencedEnvelope3D> samples = this.rawSpatialRDD.sample(false, fraction)
+                .map(new Function<T, ReferencedEnvelope3D>()
                 {
                     @Override
-                    public Envelope call(T geometry)
+                    public ReferencedEnvelope3D call(T geometry)
                             throws Exception
                     {
                         return geometry.getEnvelopeInternal();
@@ -221,9 +223,10 @@ public class SpatialRDD<T extends Geometry>
 
         // Add some padding at the top and right of the boundaryEnvelope to make
         // sure all geometries lie within the half-open rectangle.
-        final Envelope paddedBoundary = new Envelope(
-                boundaryEnvelope.getMinX(), boundaryEnvelope.getMaxX() + 0.01,
-                boundaryEnvelope.getMinY(), boundaryEnvelope.getMaxY() + 0.01);
+        final ReferencedEnvelope3D paddedBoundary = new ReferencedEnvelope3D(
+                boundaryEnvelope3D.getMinX(), boundaryEnvelope3D.getMaxX() + 0.01,
+                boundaryEnvelope3D.getMinY(), boundaryEnvelope3D.getMaxY() + 0.01,
+                boundaryEnvelope3D.getMinZ(), boundaryEnvelope3D.getMaxZ() + 0.01);
 
         switch (gridType) {
             case EQUALGRID: {
@@ -246,16 +249,25 @@ public class SpatialRDD<T extends Geometry>
                 final KDB tree = new KDB(samples.size() / numPartitions, numPartitions, paddedBoundary);
                 for (final Envelope sample : samples) {
                     tree.insert(sample);
+                
                 }
                 tree.assignLeafIds();
                 partitioner = new KDBTreePartitioner(tree);
                 break;
-            }
+	        }
+
+            case OCTTREE: {
+	        OcttreePartitioning octtreePartitioning = new OcttreePartitioning(samples, paddedBoundary, numPartitions);
+		StandardOctTree tree = octtreePartitioning.getPartitionTree();
+		partitionner = new OctTreePartitioner(tree);
+		break;
+	    }
             default:
                 throw new Exception("[AbstractSpatialRDD][spatialPartitioning] Unsupported spatial partitioning method. " +
                         "The following partitioning methods are not longer supported: R-Tree, Hilbert curve, Voronoi");
         }
     }
+
 
     public void spatialPartitioning(GridType gridType, int numPartitions)
             throws Exception
@@ -278,7 +290,7 @@ public class SpatialRDD<T extends Geometry>
     /**
      * @deprecated Use spatialPartitioning(SpatialPartitioner partitioner)
      */
-    public boolean spatialPartitioning(final List<Envelope> otherGrids)
+    public boolean spatialPartitioning(final List<ReferencedEnvelope3D> otherGrids)
             throws Exception
     {
         this.partitioner = new FlatGridPartitioner(otherGrids);
